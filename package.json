@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "jsforce": "^3.10.22"
+  }
+}
