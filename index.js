@@ -1,77 +1,111 @@
-const jsforce = require('jsforce');
+#!/usr/bin/env node
+const yargs = require('yargs');
+const { hideBin } = require('yargs/helpers');
 
-/**
- * Connect to a Salesforce org using username/password flow.
- */
-async function connectSFDC() {
-  const username = process.env.SF_USERNAME;
-  const password = process.env.SF_PASSWORD;
-  const securityToken = process.env.SF_SECURITY_TOKEN;
+const { connectSFDC, describeObject, parseFields, fetchRecords } = require('./lib/sfdc');
+const {
+  connectPG,
+  dropTableIfExists,
+  createTable,
+  insertRecords,
+} = require('./lib/pg');
 
-  if (!username || !password || !securityToken) {
-    throw new Error(
-      'Missing env vars: SF_USERNAME, SF_PASSWORD, SF_SECURITY_TOKEN are required.'
-    );
-  }
-
-  const loginUrl = process.env.SF_LOGIN_URL || 'https://login.salesforce.com';
-
-  const conn = new jsforce.Connection({ loginUrl });
-
-  await conn.login(username, password + securityToken);
-
-  console.log('Connected as:', conn.user.userName);
-  console.log('Instance URL:', conn.instanceUrl);
-  console.log(
-    'API Usage: %d / %d',
-    conn.limitInfo.apiUsage.used,
-    conn.limitInfo.apiUsage.limit
-  );
-
-  return conn;
-}
-
-/**
- * Query records from a Salesforce object.
- */
-async function queryAll(conn, sobject, fields, where) {
-  const base = `SELECT ${fields} FROM ${sobject}`;
-  const query = where ? `${base} WHERE ${where}` : base;
-  console.log('Querying:', query);
-
-  const records = [];
-  return new Promise((resolve, reject) => {
-    conn
-      .query(query)
-      .on('record', (record) => records.push(record))
-      .on('end', () => resolve(records))
-      .on('error', (err) => reject(err));
-  });
-}
-
-/**
- * Example usage — query Account records.
- */
 async function main() {
+  const argv = yargs(hideBin(process.argv))
+    .option('tableName', {
+      alias: 't',
+      type: 'string',
+      description: 'Override PostgreSQL table name (default: use Salesforce object name as-is)',
+    })
+    .option('dryRun', {
+      alias: 'd',
+      type: 'boolean',
+      default: false,
+      description: 'Create schema only — skip data copy',
+    })
+    .option('limit', {
+      alias: 'l',
+      type: 'number',
+      description: 'Max rows to fetch from Salesforce (default: all)',
+    })
+    .demandCommand(1, 'Salesforce object name is required (e.g. Account, Contact)')
+    .strict()
+    .parse();
+
+  const sfdcObject = argv._[0];
+  const tableName = argv.tableName || sfdcObject;
+
+  console.log('=== Salesforce → PostgreSQL Sync ===');
+  console.log('Object :', sfdcObject);
+  console.log('Table  :', tableName);
+  console.log('Dry run:', argv.dryRun ? 'yes' : 'no');
+  if (argv.limit != null) {
+    console.log('Limit  :', argv.limit);
+  }
+  console.log();
+
+  // --- Salesforce: connect + describe ---
   const conn = await connectSFDC();
+  const describeResult = await describeObject(conn, sfdcObject);
+  const fields = parseFields(describeResult);
 
-  const accounts = await queryAll(
-    conn,
-    'Account',
-    'Id, Name, Industry, AnnualRevenue',
-    "Industry = 'Technology'"
-  );
+  // Print column definitions
+  console.log('\n--- Column definitions ---');
+  fields.forEach((f) => {
+    const meta = [];
+    if (f.length) meta.push(`len=${f.length}`);
+    if (f.precision != null && f.scale != null) meta.push(`p=${f.precision},s=${f.scale}`);
+    console.log(`  ${f.name.padEnd(30)} ${mapSFType(f.type).padEnd(25)} -- ${f.label}${meta.length ? ` [${meta.join(', ')}]` : ''}`);
+  });
 
-  console.log('\nFound %d records:', accounts.length);
-  for (const acc of accounts.slice(0, 10)) {
-    console.log(' - %s | %s | $%s', acc.Name, acc.Industry, acc.AnnualRevenue);
+  if (argv.dryRun) {
+    console.log('\n[Dry run — schema only, no data copied.]');
+    process.exit(0);
   }
 
-  if (accounts.length > 10) {
-    console.log('  ... and %d more', accounts.length - 10);
+  // --- PostgreSQL: connect + create table ---
+  const pgClient = await connectPG();
+
+  await dropTableIfExists(pgClient, tableName);
+  await createTable(pgClient, tableName, fields);
+  console.log(`\nTable "${tableName}" created.`);
+
+  // --- Fetch & insert data ---
+  console.log('\n--- Fetching records ---');
+  const records = await fetchRecords(conn, sfdcObject, fields, argv.limit);
+  console.log(`Fetched ${records.length} record(s).`);
+
+  if (records.length) {
+    console.log('\n--- Inserting into PostgreSQL ---');
+    await insertRecords(pgClient, tableName, fields, records);
   }
 
-  return conn;
+  await pgClient.end();
+  console.log('\nDone.');
+}
+
+/** Quick type label helper for logging (not the PG mapping — that lives in lib/pg.js). */
+function mapSFType(sfType) {
+  const short = {
+    string: 'string',
+    reference: 'reference',
+    id: 'id',
+    boolean: 'boolean',
+    int: 'int',
+    long: 'long',
+    double: 'double',
+    decimal: 'decimal',
+    currency: 'currency',
+    date: 'date',
+    datetime: 'datetime',
+    time: 'time',
+    textarea: 'textarea',
+    picklist: 'picklist',
+    multipicklist: 'multipicklist',
+    percent: 'percent',
+    phone: 'phone',
+  };
+  return short[sfType] || sfType;
 }
 
 main()
