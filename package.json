@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "dotenv": "^17.4.2",
     "jsforce": "^3.10.22",
     "pg": "^8.23.0",
     "yargs": "^18.1.0"
