@@ -31,7 +31,7 @@ async function main() {
     .demandCommand(1, 'Salesforce object name is required (e.g. Account, Contact)')
     .strict()
     .parse();
-
+    console.log(argv);
   const sfdcObject = argv._[0];
   const tableName = argv.tableName || sfdcObject;
 
